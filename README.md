@@ -7,5 +7,6 @@ With features like iterative debugging, syntax verification, and automatic recon
 Whether you need to create custom scripts, automate repetitive tasks, or develop agents that solve specific problems, this repository provides a powerful framework for building adaptable solutions using AI-driven agents and the Groq API.
 
 still in progress
+o1, gpt4o, gpt-3.5,groq
 
 bitcoin wallet: 0xC02EAd387ab4a38B6221b88aD258EDC180179fae
