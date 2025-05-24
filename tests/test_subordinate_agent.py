@@ -10,56 +10,54 @@ import os
 from subordinate_agent import SubordinateAgent
 
 class TestSubordinateAgent(unittest.TestCase):
+# sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from subordinate_agent import SubordinateAgent
+from llm_interface import LLMInterface # For mocking
+
+class TestSubordinateAgent(unittest.TestCase):
     def setUp(self):
-        self.agent = SubordinateAgent(prompt="Initial prompt", groq_api_key="fake_key")
+        # Mock the LLMInterface client
+        self.mock_llm_client = MagicMock(spec=LLMInterface)
+        self.agent = SubordinateAgent(prompt="Initial prompt", llm_client=self.mock_llm_client)
         self.agent.id = 1 # Simulating ID assignment by MainAgent
 
     def test_initialization(self):
         self.assertEqual(self.agent.prompt, "Initial prompt")
-        self.assertEqual(self.agent.groq_api_key, "fake_key")
+        self.assertIs(self.agent.llm_client, self.mock_llm_client)
         self.assertIsNone(self.agent.generated_code)
         self.assertEqual(self.agent.status, "initialized")
         self.assertEqual(self.agent.id, 1)
-        self.assertIsNone(self.agent.client) # Groq client not initialized yet
 
-    @patch('subordinate_agent.Groq')
-    def test_generate_code_success_and_sub_calls(self, MockGroq):
-        mock_chat_completion = MagicMock()
-        mock_chat_completion.choices = [MagicMock()]
-        mock_chat_completion.choices[0].message.content = "import os\nprint(os.name)"
-        
-        mock_groq_instance = MockGroq.return_value
-        mock_groq_instance.chat.completions.create.return_value = mock_chat_completion
+    def test_generate_code_success_and_sub_calls(self):
+        # Configure the mock LLM client's generate_text method
+        generated_code_text = "import os\nprint(os.name)"
+        self.mock_llm_client.generate_text.return_value = generated_code_text
 
-        # We want to test the internal calls to verify_syntax and identify_dependencies
-        # So we spy on them.
+        # Spy on verify_syntax and identify_dependencies
         with patch.object(self.agent, 'verify_syntax', wraps=self.agent.verify_syntax) as spy_verify_syntax:
             with patch.object(self.agent, 'identify_dependencies', wraps=self.agent.identify_dependencies) as spy_identify_dependencies:
                 self.agent.generate_code()
 
-                self.assertEqual(self.agent.generated_code, "import os\nprint(os.name)")
-                MockGroq.assert_called_once_with(api_key="fake_key")
-                mock_groq_instance.chat.completions.create.assert_called_once_with(
-                    messages=[{"role": "user", "content": "Initial prompt"}],
-                    model="mixtral-8x7b-32768"
-                )
+                self.assertEqual(self.agent.generated_code, generated_code_text)
+                # Check that the llm_client's generate_text was called correctly
+                self.mock_llm_client.generate_text.assert_called_once_with("Initial prompt")
+                
                 spy_verify_syntax.assert_called_once()
-                # verify_syntax calls identify_dependencies if syntax is valid
-                self.assertTrue(self.agent.is_syntax_valid) # Check that syntax was indeed valid
+                self.assertTrue(self.agent.is_syntax_valid) # Assumes generated_code_text is valid
                 spy_identify_dependencies.assert_called_once()
                 self.assertEqual(self.agent.dependencies, {"os"})
                 self.assertEqual(self.agent.status, "dependencies_identified")
 
 
-    @patch('subordinate_agent.Groq')
-    def test_generate_code_api_error(self, MockGroq):
-        mock_groq_instance = MockGroq.return_value
-        mock_groq_instance.chat.completions.create.side_effect = Exception("API Error")
+    def test_generate_code_llm_error(self):
+        # Configure the mock LLM client's generate_text method to raise an exception
+        self.mock_llm_client.generate_text.side_effect = Exception("LLM API Error")
 
-        with patch.object(self.agent, 'verify_syntax') as mock_verify_syntax: # Mock, not spy
+        with patch.object(self.agent, 'verify_syntax') as mock_verify_syntax:
             self.agent.generate_code()
             self.assertIsNone(self.agent.generated_code)
-            self.assertTrue("error_generating_code: API Error" in self.agent.status)
+            self.assertTrue("error_generating_code: LLM API Error" in self.agent.status)
             mock_verify_syntax.assert_not_called()
 
     def test_verify_syntax_valid_calls_identify_dependencies(self):

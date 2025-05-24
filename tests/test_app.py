@@ -12,11 +12,17 @@ from app import app # Import the Flask app instance
 # from main_agent import MainAgent # Not strictly needed if we patch main_agent_instance
 # from subordinate_agent import SubordinateAgent # Not strictly needed for these tests
 
+# Import app for context in AsyncResult mock checks
+from app import app, celery_app 
+
 class TestWebApp(unittest.TestCase):
     def setUp(self):
         """Set up test client and app configuration for each test."""
         app.config['TESTING'] = True
         app.config['WTF_CSRF_ENABLED'] = False # Disable CSRF for testing forms if applicable
+        # Ensure Celery is in eager mode for synchronous testing of task logic if needed elsewhere,
+        # but for route testing, we mock apply_async and AsyncResult.
+        # celery_app.conf.update(task_always_eager=True)
         self.app = app.test_client()
 
     def test_index_route_get(self):
@@ -24,53 +30,132 @@ class TestWebApp(unittest.TestCase):
         response = self.app.get('/')
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Horus Agent Interface", response.data)
-        self.assertIn(b"Enter a prompt to create an agent.", response.data)
+        # The message is now set by JS, so we might not find the old one.
+        # self.assertIn(b"Enter a prompt to create an agent.", response.data) 
+        self.assertIn(b"Create New Agent", response.data) # Check for form presence
 
-    @patch('app.main_agent_instance') # Patch the global instance in app.py
-    def test_create_agent_route_post_valid_prompt(self, MockMainAgentInstance):
-        """Test the /create_agent route with a valid prompt."""
-        # Configure the mock MainAgent's create_subordinate_agent method
-        mock_sub_agent = MagicMock()
-        mock_sub_agent.id = 1
-        mock_sub_agent.prompt = "test prompt for app"
-        mock_sub_agent.generated_code = "print('mocked code by app test')"
-        mock_sub_agent.status = "mock_status_complete_for_app"
-        mock_sub_agent.is_syntax_valid = True
-        mock_sub_agent.syntax_error_message = None
-        mock_sub_agent.execution_successful = True
-        mock_sub_agent.execution_output = "Mocked execution output."
-        mock_sub_agent.execution_error = ""
-        mock_sub_agent.dependencies = {"mock_dep1", "mock_dep2"}
-        mock_sub_agent.installation_logs = ["Installed mock_dep1 (simulated)"]
-        
-        MockMainAgentInstance.create_subordinate_agent.return_value = mock_sub_agent
+    # Test /create_agent endpoint
+    @patch('app.process_agent_task') # Patch the Celery task object in app.py
+    def test_create_agent_route_calls_celery_task(self, mock_process_agent_task):
+        # Configure the mock task's apply_async method
+        mock_task_instance = MagicMock()
+        mock_task_instance.id = "test_task_123"
+        mock_process_agent_task.apply_async.return_value = mock_task_instance
 
-        # Simulate POST request to /create_agent
-        response = self.app.post('/create_agent', data={'prompt': 'test prompt for app'})
-        
+        response = self.app.post('/create_agent', data={
+            'prompt': 'test celery prompt',
+            'llm_type': 'groq',
+            'model_name': 'mixtral-test'
+        })
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Agent processing complete", response.data)
-        self.assertIn(b"mocked code by app test", response.data)
-        self.assertIn(b"mock_status_complete_for_app", response.data)
-        self.assertIn(b"Mocked execution output.", response.data)
-        self.assertIn(b"mock_dep1", response.data) # Check if dependencies are displayed
-
-        # Verify that MainAgent's method was called correctly
-        MockMainAgentInstance.create_subordinate_agent.assert_called_once_with(prompt='test prompt for app')
+        json_response = response.get_json()
+        self.assertEqual(json_response['task_id'], "test_task_123")
+        self.assertIn('/task_status/test_task_123', json_response['status_url'])
         
-        # Verify methods on the subordinate agent mock were called
-        mock_sub_agent.generate_code.assert_called_once()
-        # Given is_syntax_valid = True, execute_code should be called
-        mock_sub_agent.execute_code.assert_called_once()
-        # Given dependencies were identified, install_dependencies should be called
-        mock_sub_agent.install_dependencies.assert_called_once()
+        mock_process_agent_task.apply_async.assert_called_once_with(
+            args=['test celery prompt', 'groq', 'mixtral-test']
+        )
 
     def test_create_agent_route_post_empty_prompt(self):
         """Test the /create_agent route with an empty prompt."""
         response = self.app.post('/create_agent', data={'prompt': ''})
-        self.assertEqual(response.status_code, 200) # The route returns 200 but shows an error message
-        self.assertIn(b"Prompt cannot be empty", response.data)
-        self.assertNotIn(b"Agent processing complete", response.data)
+        self.assertEqual(response.status_code, 400) 
+        json_response = response.get_json()
+        self.assertIn("Prompt cannot be empty", json_response['error'])
+        
+    # Tests for /task_status/<task_id> endpoint
+    @patch('app.AsyncResult') # Patch AsyncResult where it's used in app.py
+    def test_task_status_route_pending(self, MockAsyncResult):
+        mock_task = MockAsyncResult.return_value
+        mock_task.id = "test_task_pending"
+        mock_task.state = "PENDING"
+        mock_task.info = None # Or some initial info if set by Celery
+
+        response = self.app.get('/task_status/test_task_pending')
+        self.assertEqual(response.status_code, 200)
+        json_response = response.get_json()
+        self.assertEqual(json_response['state'], "PENDING")
+        self.assertEqual(json_response['status_message'], "Task is pending.")
+        MockAsyncResult.assert_called_once_with("test_task_pending", app=celery_app)
+
+
+    @patch('app.AsyncResult')
+    def test_task_status_route_progress(self, MockAsyncResult):
+        mock_task = MockAsyncResult.return_value
+        mock_task.id = "test_task_prog"
+        mock_task.state = "PROGRESS"
+        # This is what update_state(meta=...) sets in task_result.info
+        mock_task.info = {'status': 'Generating code...'} 
+
+        response = self.app.get('/task_status/test_task_prog')
+        self.assertEqual(response.status_code, 200)
+        json_response = response.get_json()
+        self.assertEqual(json_response['state'], "PROGRESS")
+        self.assertEqual(json_response['status_message'], "Task in progress.")
+        self.assertEqual(json_response['current_status_message'], 'Generating code...')
+        self.assertEqual(json_response['meta']['status'], 'Generating code...')
+        MockAsyncResult.assert_called_once_with("test_task_prog", app=celery_app)
+
+    @patch('app.AsyncResult')
+    def test_task_status_route_success(self, MockAsyncResult):
+        mock_task = MockAsyncResult.return_value
+        mock_task.id = "test_task_success"
+        mock_task.state = "SUCCESS"
+        # This structure matches what our process_agent_task returns
+        mock_task.result = { 
+            'status': 'SUCCESS', 
+            'result': {'id': 1, 'prompt': 'done', 'status': 'completed_successfully'},
+            'current_status_message': 'All done!'
+        }
+
+        response = self.app.get('/task_status/test_task_success')
+        self.assertEqual(response.status_code, 200)
+        json_response = response.get_json()
+        self.assertEqual(json_response['state'], "SUCCESS")
+        self.assertEqual(json_response['status_message'], "Task completed successfully.")
+        self.assertEqual(json_response['result']['prompt'], 'done')
+        self.assertEqual(json_response['current_status_message'], 'All done!')
+        MockAsyncResult.assert_called_once_with("test_task_success", app=celery_app)
+    
+    @patch('app.AsyncResult')
+    def test_task_status_route_failure_custom_error(self, MockAsyncResult):
+        mock_task = MockAsyncResult.return_value
+        mock_task.id = "test_task_fail_custom"
+        mock_task.state = "FAILURE"
+        # This structure matches what our process_agent_task returns on handled failure
+        mock_task.result = {
+            'status': 'FAILURE', 
+            'error': 'Task failed badly due to X.',
+            'current_status_message': 'Processing failed at step X.'
+        }
+        mock_task.info = mock_task.result # Celery might put the return value in .info for FAILURE states too
+
+        response = self.app.get('/task_status/test_task_fail_custom')
+        self.assertEqual(response.status_code, 200)
+        json_response = response.get_json()
+        self.assertEqual(json_response['state'], "FAILURE")
+        self.assertEqual(json_response['status_message'], "Task failed.")
+        self.assertEqual(json_response['error'], 'Task failed badly due to X.')
+        self.assertEqual(json_response['current_status_message'], 'Processing failed at step X.')
+        MockAsyncResult.assert_called_once_with("test_task_fail_custom", app=celery_app)
+
+    @patch('app.AsyncResult')
+    def test_task_status_route_failure_unhandled_exception(self, MockAsyncResult):
+        mock_task = MockAsyncResult.return_value
+        mock_task.id = "test_task_fail_unhandled"
+        mock_task.state = "FAILURE"
+        # Celery stores the actual exception instance in .info for unhandled exceptions
+        mock_task.info = ValueError("Something went very wrong") 
+        mock_task.result = None # No custom result structure in this case
+
+        response = self.app.get('/task_status/test_task_fail_unhandled')
+        self.assertEqual(response.status_code, 200)
+        json_response = response.get_json()
+        self.assertEqual(json_response['state'], "FAILURE")
+        self.assertEqual(json_response['status_message'], "Task failed.")
+        self.assertEqual(json_response['error'], "ValueError('Something went very wrong')") # str(exception)
+        self.assertEqual(json_response['current_status_message'], 'Failed with unhandled exception.')
+        MockAsyncResult.assert_called_once_with("test_task_fail_unhandled", app=celery_app)
 
 
 if __name__ == '__main__':

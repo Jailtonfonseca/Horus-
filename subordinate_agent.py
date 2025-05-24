@@ -1,40 +1,34 @@
 class SubordinateAgent:
     """
-    A subordinate agent responsible for generating and validating code based on a prompt.
+from llm_interface import LLMInterface # Added import
+
+class SubordinateAgent:
     """
-    def __init__(self, prompt: str, groq_api_key: str):
+    A subordinate agent responsible for generating and validating code based on a prompt,
+    using a provided LLM client.
+    """
+    def __init__(self, prompt: str, llm_client: LLMInterface):
         """
         Initializes the SubordinateAgent.
 
         Args:
             prompt: The prompt for the agent.
-            groq_api_key: The Groq API key.
+            llm_client: An instance of a class implementing LLMInterface.
         """
         self.prompt = prompt
-        self.groq_api_key = groq_api_key
+        self.llm_client = llm_client # Store the LLM client instance
         self.generated_code = None
         self.status = "initialized"
-        self.client = None # Will be initialized in generate_code
+        # Removed self.groq_api_key and self.client (Groq specific)
 
     def generate_code(self):
         """
-        Generates code based on the prompt using the Groq API.
+        Generates code based on the prompt using the provided LLM client.
         """
         try:
-            from groq import Groq
-            if self.client is None:
-                self.client = Groq(api_key=self.groq_api_key)
-
-            chat_completion = self.client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": self.prompt,
-                    }
-                ],
-                model="mixtral-8x7b-32768",
-            )
-            self.generated_code = chat_completion.choices[0].message.content
+            # Parameters like model, temperature, max_tokens will be handled by
+            # the LLM client's implementation or its defaults.
+            self.generated_code = self.llm_client.generate_text(self.prompt)
             self.status = "code_generated"
             # Automatically verify syntax after generation
             self.verify_syntax()

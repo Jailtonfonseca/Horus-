@@ -1,1 +1,4 @@
 Flask
+openai
+celery
+redis
