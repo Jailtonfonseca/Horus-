@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Horus Agent Interface</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        .container { max-width: 800px; margin: auto; }
+        textarea { width: 100%; min-height: 100px; margin-bottom: 10px; }
+        .output-area { background-color: #f4f4f4; padding: 10px; border: 1px solid #ddd; margin-top: 20px; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Horus Agent Interface</h1>
+
+        <form action="/create_agent" method="POST">
+            <h2>Create New Agent</h2>
+            <label for="prompt">Enter your prompt:</label><br>
+            <textarea id="prompt" name="prompt" rows="5" required></textarea><br>
+            <input type="submit" value="Create Agent & Generate Code">
+        </form>
+
+        {% if agent_status %}
+        <div class="output-area">
+            <h3>Agent Status & Output</h3>
+            <p><strong>Status:</strong> {{ agent_status.status | default('N/A') }}</p>
+            
+            {% if agent_status.prompt %}
+            <p><strong>Initial Prompt:</strong></p>
+            <pre>{{ agent_status.prompt }}</pre>
+            {% endif %}
+
+            {% if agent_status.generated_code %}
+            <p><strong>Generated Code:</strong></p>
+            <pre>{{ agent_status.generated_code }}</pre>
+            {% endif %}
+            
+            {% if agent_status.syntax_error_message %}
+            <p><strong>Syntax Error:</strong></p>
+            <pre>{{ agent_status.syntax_error_message }}</pre>
+            {% endif %}
+
+            {% if agent_status.execution_output %}
+            <p><strong>Execution Output:</strong></p>
+            <pre>{{ agent_status.execution_output }}</pre>
+            {% endif %}
+
+            {% if agent_status.execution_error %}
+            <p><strong>Execution Error:</strong></p>
+            <pre>{{ agent_status.execution_error }}</pre>
+            {% endif %}
+
+            {% if agent_status.dependencies %}
+            <p><strong>Identified Dependencies:</strong></p>
+            <pre>{{ agent_status.dependencies | join(', ') }}</pre>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        <!-- Placeholder for a list of existing agents -->
+        <!-- <div class="output-area">
+            <h3>Managed Agents</h3>
+            <p>Agent list will appear here.</p>
+        </div> -->
+    </div>
+</body>
+</html>
