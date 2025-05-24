@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Horus Agent Interface</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        .container { max-width: 800px; margin: auto; }
+        textarea { width: 100%; min-height: 100px; margin-bottom: 10px; }
+        .output-area { background-color: #f4f4f4; padding: 10px; border: 1px solid #ddd; margin-top: 20px; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+        #task-status-area { margin-top: 20px; padding: 10px; border: 1px solid #eee; background-color: #f9f9f9; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Horus Agent Interface</h1>
+
+        <form id="agentForm" action="{{ url_for('create_agent_route') }}" method="POST">
+            <h2>Create New Agent</h2>
+            <label for="prompt">Enter your prompt:</label><br>
+            <textarea id="prompt" name="prompt" rows="5" required></textarea><br>
+
+            <label for="llm_type">Select LLM Provider:</label>
+            <select name="llm_type" id="llm_type">
+                <option value="groq" selected>Groq</option>
+                <option value="openai">OpenAI</option>
+            </select>
+            <br><br>
+
+            <label for="model_name">Model Name (optional):</label>
+            <input type="text" id="model_name" name="model_name" placeholder="e.g., mixtral-8x7b-32768 or gpt-4-turbo">
+            <br><br>
+
+            <input type="submit" value="Create Agent & Generate Code">
+        </form>
+
+        <!-- Old agent_status Jinja block is removed/commented -->
+        <!-- 
+        {% if agent_status %}
+        <div class="output-area">
+            <h3>Agent Status & Output</h3>
+            <p><strong>Status:</strong> {{ agent_status.status | default('N/A') }}</p>
+            ... (rest of the old block) ...
+        </div>
+        {% endif %}
+        -->
+
+        <div id="task-status-area" style="margin-top: 20px; padding: 10px; border: 1px solid #eee;">
+            Please submit a prompt to start agent processing.
+        </div>
+
+        <div id="agent-output-display" class="output-area" style="display: none;">
+            <!-- Agent results will be populated here by JavaScript -->
+        </div>
+        
+    </div>
+
+    <script>
+        const agentForm = document.getElementById('agentForm');
+        const taskStatusArea = document.getElementById('task-status-area');
+        const agentOutputDisplay = document.getElementById('agent-output-display');
+
+        agentForm.addEventListener('submit', handleSubmit);
+
+        function escapeHtml(unsafe) {
+            if (unsafe === null || typeof unsafe === 'undefined') return '';
+            return String(unsafe)
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+
+        function clearAgentOutput() {
+            if (agentOutputDisplay) {
+                agentOutputDisplay.innerHTML = '';
+                agentOutputDisplay.style.display = 'none';
+            }
+        }
+
+        async function handleSubmit(event) {
+            event.preventDefault();
+            taskStatusArea.innerHTML = 'Submitting task...';
+            clearAgentOutput();
+
+            const formData = new FormData(agentForm);
+
+            try {
+                // Note: The action attribute in the form is not directly used by fetch with FormData.
+                // The URL is specified directly in the fetch call.
+                const response = await fetch("{{ url_for('create_agent_route') }}", {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({ error: 'Failed to start task. Server error.' }));
+                    taskStatusArea.innerHTML = `Error: ${escapeHtml(errorData.error || response.statusText)}`;
+                    return;
+                }
+
+                const data = await response.json();
+                if (data.task_id) {
+                    taskStatusArea.innerHTML = `Task submitted! ID: ${escapeHtml(data.task_id)}. Waiting for updates... <br>Status URL (for direct access): <a href="${escapeHtml(data.status_url)}" target="_blank">${escapeHtml(data.status_url)}</a>`;
+                    pollTaskStatus(data.task_id);
+                } else {
+                    taskStatusArea.innerHTML = 'Error: Could not retrieve task ID from server.';
+                }
+            } catch (error) {
+                console.error('Error submitting task:', error);
+                taskStatusArea.innerHTML = 'Error submitting task. Check console for details.';
+            }
+        }
+
+        async function pollTaskStatus(taskId) {
+            try {
+                const statusUrl = "{{ url_for('task_status_route', task_id='TASK_ID_PLACEHOLDER') }}".replace('TASK_ID_PLACEHOLDER', taskId);
+                const response = await fetch(statusUrl);
+
+                if (!response.ok) {
+                    taskStatusArea.innerHTML = `Error fetching status for task ${escapeHtml(taskId)}: ${escapeHtml(response.statusText)}. Retrying...`;
+                    setTimeout(() => pollTaskStatus(taskId), 5000); // Retry after 5 seconds
+                    return;
+                }
+
+                const data = await response.json();
+                let statusHtml = `<strong>Task ID:</strong> ${escapeHtml(data.task_id)}<br>
+                                  <strong>State:</strong> ${escapeHtml(data.state)}<br>
+                                  <strong>Status Details:</strong> ${escapeHtml(data.current_status_message || data.status_message || '')}`;
+                
+                // Using current_status_message from the server response if available, else default from state
+                // The server now sends current_status_message, so data.meta.status is less critical here
+                // but can be added if more detailed progress is needed.
+                // if (data.meta && data.meta.status) {
+                //      statusHtml += `<br><strong>Progress:</strong> ${escapeHtml(data.meta.status)}`;
+                // }
+                taskStatusArea.innerHTML = statusHtml;
+
+                if (data.state === 'SUCCESS') {
+                    if (data.result) { // data.result contains the task's actual return value (the agent_data dict)
+                        displayResults(data.result);
+                        taskStatusArea.innerHTML += '<br><strong>Processing complete!</strong>';
+                    } else {
+                         taskStatusArea.innerHTML += '<br><strong>Processing complete, but no detailed result data found.</strong>';
+                         console.warn("Task SUCCESS but no result data in response:", data);
+                    }
+                } else if (data.state === 'FAILURE') {
+                    let errorMsg = data.error || (data.result && data.result.error) || 'Unknown failure.';
+                    taskStatusArea.innerHTML += `<br><strong>Error:</strong> ${escapeHtml(errorMsg)}`;
+                } else if (data.state === 'PENDING' || data.state === 'PROGRESS') {
+                    setTimeout(() => pollTaskStatus(taskId), 3000); // Poll every 3 seconds
+                }
+            } catch (error) {
+                console.error('Error polling status:', error);
+                taskStatusArea.innerHTML = `Error polling status for task ${escapeHtml(taskId)}. Check console. Retrying...`;
+                setTimeout(() => pollTaskStatus(taskId), 5000); // Retry after 5 seconds
+            }
+        }
+
+        function displayResults(agentData) {
+            if (!agentData) {
+                agentOutputDisplay.innerHTML = '<p>No results to display or result format unexpected.</p>';
+                agentOutputDisplay.style.display = 'block';
+                console.warn("displayResults called with no agentData:", agentData);
+                return;
+            }
+            
+            clearAgentOutput(); 
+            agentOutputDisplay.style.display = 'block';
+
+            let htmlContent = '<h3>Agent Process Output</h3>';
+            htmlContent += `<p><strong>Agent ID:</strong> ${escapeHtml(agentData.id)}</p>`;
+            htmlContent += `<p><strong>Overall Final Status:</strong> ${escapeHtml(agentData.status)}</p>`;
+
+            if (agentData.prompt) {
+                htmlContent += `<p><strong>Initial Prompt:</strong></p><pre>${escapeHtml(agentData.prompt)}</pre>`;
+            }
+            if (agentData.generated_code) {
+                htmlContent += `<p><strong>Generated Code:</strong></p><pre>${escapeHtml(agentData.generated_code)}</pre>`;
+            }
+            if (agentData.is_syntax_valid === false && agentData.syntax_error_message) {
+                htmlContent += `<p><strong>Syntax Check:</strong> Invalid</p>`;
+                htmlContent += `<p><strong>Syntax Error:</strong></p><pre>${escapeHtml(agentData.syntax_error_message)}</pre>`;
+            } else if (agentData.is_syntax_valid === true) {
+                htmlContent += `<p><strong>Syntax Check:</strong> Valid</p>`;
+            }
+
+            // Ensure boolean values are displayed as strings
+            if (typeof agentData.execution_successful !== 'undefined' && agentData.execution_successful !== null) {
+                htmlContent += `<p><strong>Execution Successful:</strong> ${escapeHtml(String(agentData.execution_successful))}</p>`;
+            }
+            if (agentData.execution_output) {
+                htmlContent += `<p><strong>Execution Output:</strong></p><pre>${escapeHtml(agentData.execution_output)}</pre>`;
+            }
+            if (agentData.execution_error) {
+                htmlContent += `<p><strong>Execution Error:</strong></p><pre>${escapeHtml(agentData.execution_error)}</pre>`;
+            }
+            if (agentData.dependencies && agentData.dependencies.length > 0) {
+                htmlContent += `<p><strong>Identified Dependencies:</strong></p><pre>${escapeHtml(agentData.dependencies.join(', '))}</pre>`;
+            }
+            if (agentData.installation_logs && agentData.installation_logs.length > 0) {
+                htmlContent += `<p><strong>Installation Logs (Simulated):</strong></p><pre>${escapeHtml(agentData.installation_logs.join('\n'))}</pre>`;
+            }
+            
+            agentOutputDisplay.innerHTML = htmlContent;
+        }
+
+        // Initial page setup
+        clearAgentOutput();
+        taskStatusArea.innerHTML = 'Please submit a prompt to start agent processing.';
+    </script>
+</body>
+</html>
