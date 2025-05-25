@@ -23,13 +23,22 @@ Horus is a multi-agent system designed for code generation, validation, and mana
 -   **Asynchronous Task Processing**:
     -   Uses Celery with Redis to handle agent tasks asynchronously, preventing UI blocking during LLM interactions and code processing.
     -   Web interface polls for task status and displays results dynamically.
--   **Code Generation**: Subordinate agents generate code based on user prompts and selected LLM.
--   **Syntax Verification**: Uses `ast.parse()` to check the syntax of generated Python code.
--   **Dependency Identification**: Parses import statements in generated code to identify dependencies.
--   **Code Execution**: Executes generated Python code in a controlled environment, capturing stdout and stderr.
+-   **Iterative Debugging / Self-Correction**:
+    -   Agents attempt to fix their own generated code if syntax or runtime errors occur.
+    -   Utilizes a feedback loop: errors from validation or execution are used to construct a new prompt, asking the LLM to correct the previous code.
+    -   This process repeats up to a configurable number of attempts (`max_correction_attempts` in `SubordinateAgent`).
+    -   The generation history, including all attempts, prompts, generated code, and errors, is tracked and can be displayed in the UI.
+-   **Code Generation**: Subordinate agents generate code based on user prompts and selected LLM, potentially making multiple attempts to produce working code.
+-   **Syntax Verification**: Uses `ast.parse()` to check the syntax of generated Python code during each correction attempt.
+-   **Dependency Identification**: Parses import statements in generated code to identify dependencies (performed on successfully syntax-validated code).
+-   **Sandboxed Code Execution**: 
+    -   Executes generated Python code in an isolated environment using `multiprocessing.Process`. This provides a basic level of sandboxing from the main application.
+    -   Captures `stdout`, `stderr`, and exceptions (including full tracebacks) from the executed code.
+    -   Includes a configurable timeout (`execution_timeout` in `SubordinateAgent`) to prevent runaway scripts.
+    -   **Sandboxing Limitations**: The current process-based sandboxing is a basic security measure and is not as robust as containerization (e.g., Docker) or full virtualization. It may be susceptible to resource exhaustion attacks if the executed code is malicious and OS-level limits are not strictly enforced. Direct filesystem and network access from the executed code are possible within the permissions of the user running the Celery worker process. See "Known Limitations and Future Work" for more details.
 -   **Dependency Management (Simulated)**: Simulates the installation of identified dependencies.
--   **Agent Reconstruction**: Allows agents to regenerate code based on new prompts (via `MainAgent.reconstruct_subordinate_agent`).
--   **Web Interface**: User-friendly Flask UI for prompt input, LLM selection, and displaying real-time status and final results.
+-   **Agent Reconstruction**: Allows agents to regenerate code based on new prompts, utilizing the same iterative debugging process.
+-   **Web Interface**: User-friendly Flask UI for prompt input, LLM selection, and displaying real-time status, iterative generation history, and final results.
 -   **Unit Tests**: Comprehensive tests for agents, LLM interfaces, the Flask application, and Celery task integration.
 -   **Secure API Key Management**: API keys are managed via environment variables.
 
@@ -52,8 +61,12 @@ The Horus system is designed with a decoupled architecture to support various LL
     4.  A Celery worker picks up the task and executes `process_agent_task`. This task involves:
         -   Instantiating `MainAgent` (which loads API keys from environment variables).
         -   Creating a `SubordinateAgent` with the chosen LLM client.
-        -   Invoking methods on the `SubordinateAgent` for code generation (using the selected LLM), syntax validation, execution, etc.
-        -   The task updates its state periodically using `self.update_state` for progress tracking.
+    -   Invoking methods on the `SubordinateAgent`. The `SubordinateAgent.generate_code()` method now encapsulates the iterative debugging loop:
+        -   It first attempts to generate code.
+        -   If syntax or runtime errors occur, it constructs a "fix prompt" and re-queries the LLM.
+        -   This loop continues until the code is successful or `max_correction_attempts` is reached.
+        -   Code execution within this loop occurs in an isolated process (sandbox).
+    -   The Celery task updates its overall state (e.g., `PROGRESS`) but detailed step-by-step progress of the iterative loop is primarily tracked within the `SubordinateAgent`'s `generation_history`.
     5.  The web UI, meanwhile, polls a status endpoint (`/task_status/<task_id>`) in `app.py`.
     6.  This endpoint queries Celery (via Redis as the result backend) for the task's current status and any intermediate results or final output.
     7.  The UI dynamically updates to show the progress and, eventually, the final results or errors from the agent processing.
@@ -84,6 +97,12 @@ To use the LLM functionalities, you need to configure API keys for the services 
 -   You only need to set the key for the service(s) you plan to use. The application will raise an error if you try to use an LLM service for which the key is not set (e.g., selecting "OpenAI" in the UI if `OPENAI_API_KEY` is not set).
 
 The Celery broker and result backend URLs are configured in `celery_config.py` and default to `redis://localhost:6379/0`. Modify this file if your Redis instance runs elsewhere.
+
+### Other Configuration
+-   **Iterative Debugging**:
+    -   `max_correction_attempts`: The maximum number of self-correction attempts an agent will make. Default is 3. This is set in `SubordinateAgent.__init__`.
+    -   `execution_timeout`: The timeout in seconds for each code execution attempt within the sandbox. Default is 10.0 seconds. This is also set in `SubordinateAgent.__init__`.
+    Currently, these are not exposed via the UI or environment variables but can be modified directly in the `SubordinateAgent` code if needed.
 
 ## Running the Application
 
@@ -184,11 +203,18 @@ For easier local development, you can use a `.env` file to manage your API keys.
     ```
     The `MainAgent` will then be able to pick up these variables when it calls `os.getenv()`. Celery workers will also pick up these variables if `load_dotenv()` is called when the Celery app is defined or imported.
 
-## Future Enhancements (TODOs from code)
+## Known Limitations and Future Work
 
--   Expand `MainAgent` to accept a dictionary of API keys or a more structured configuration for even more flexible multi-LLM management.
--   Implement a more sophisticated execution environment/sandbox for `SubordinateAgent.execute_code` for better security and isolation.
--   Implement actual (non-simulated) dependency installation in `SubordinateAgent.install_dependencies` using `subprocess`.
+-   **Sandboxing**: The current sandboxing using `multiprocessing.Process` provides basic isolation but is not foolproof. Future work should explore more robust solutions like Docker containers or gVisor for executing untrusted code, especially if the application is exposed to external users.
+-   **LLM Errors During Correction**: If the LLM itself fails to generate a response during a correction attempt (e.g., API error, rate limit), the current loop might not handle this as gracefully as it handles code errors. More sophisticated error handling for LLM failures within the iterative loop could be added.
+-   **Prompt Engineering for Fixes**: The quality of the "fix prompts" (`_create_fix_prompt`) is crucial for effective self-correction. Further refinement of these prompts may improve the success rate of the debugging loop.
+-   **Dependency Management**: Dependency installation is currently simulated. Real installation would require careful consideration of the environment where dependencies are installed to avoid conflicts and maintain security.
+-   **Resource Management**: The current system does not have explicit limits on CPU or memory usage by the sandboxed processes beyond the timeout. For production systems, this would be critical.
+-   **Configuration Management**: Parameters like `max_correction_attempts` and `execution_timeout` are currently hardcoded defaults in `SubordinateAgent`. Exposing these via environment variables or a configuration file would offer more flexibility.
+-   **Real-time Progress Updates**: While Celery tasks update their state, the fine-grained progress of the iterative debugging loop within `SubordinateAgent` is not currently streamed to the frontend in real-time. This could be a future enhancement using WebSockets or more frequent polling with detailed status updates.
+
+### Other TODOs (from code)
+-   Expand `MainAgent` to accept a dictionary of API keys or a more structured configuration for multi-LLM management.
 -   Enhance the Flask UI to dynamically list available models for the selected LLM provider.
 -   Persist agent state and task history, potentially using a database.
 -   Add more robust error handling, user feedback, and comprehensive logging throughout the application.

@@ -202,6 +202,35 @@
             if (agentData.installation_logs && agentData.installation_logs.length > 0) {
                 htmlContent += `<p><strong>Installation Logs (Simulated):</strong></p><pre>${escapeHtml(agentData.installation_logs.join('\n'))}</pre>`;
             }
+
+            // Display correction attempts and generation history
+            if (typeof agentData.correction_attempts !== 'undefined') { // Check if the key exists
+                htmlContent += `<p><strong>Correction Attempts Made:</strong> ${escapeHtml(String(agentData.correction_attempts))} (out of ${escapeHtml(String(agentData.max_correction_attempts || 3))})</p>`;
+            }
+
+            if (agentData.generation_history && agentData.generation_history.length > 0) {
+                let historyHtml = '<h4>Generation History:</h4><ul style="list-style-type: none; padding-left: 0;">';
+                agentData.generation_history.forEach(attempt => {
+                    historyHtml += `<li style="border: 1px solid #eee; padding: 5px; margin-bottom: 5px; background-color: #fff;">`;
+                    historyHtml += `<p><strong>Attempt ${escapeHtml(String(attempt.attempt))}:</strong> <span style="font-weight: bold; color: ${attempt.status.includes('success') ? 'green' : (attempt.error_type ? 'red' : 'orange')};">${escapeHtml(attempt.status)}</span></p>`;
+                    
+                    // Display prompt for LLM (optional, can be verbose)
+                    // historyHtml += `<details><summary>View Prompt & Generated Code for Attempt ${escapeHtml(String(attempt.attempt))}</summary>`;
+                    // historyHtml += `<p><strong>Prompt for LLM:</strong></p><pre style="background-color: #e9e9e9; padding: 3px;">${escapeHtml(attempt.prompt_to_llm)}</pre>`;
+                    // if (attempt.generated_code) {
+                    //    historyHtml += `<p><strong>Generated Code by LLM:</strong></p><pre style="background-color: #e9e9e9; padding: 3px;">${escapeHtml(attempt.generated_code)}</pre>`;
+                    // }
+                    // historyHtml += `</details>`;
+
+                    if (attempt.error_type) {
+                        historyHtml += `<p style="color: red;"><strong>Error Type:</strong> ${escapeHtml(attempt.error_type)}</p>`;
+                        historyHtml += `<p style="color: red;"><strong>Error Message:</strong></p><pre style="background-color: #ffebeb; padding: 3px;">${escapeHtml(attempt.error_message)}</pre>`;
+                    }
+                    historyHtml += `</li>`;
+                });
+                historyHtml += '</ul>';
+                htmlContent += historyHtml;
+            }
             
             agentOutputDisplay.innerHTML = htmlContent;
         }

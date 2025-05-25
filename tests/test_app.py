@@ -104,7 +104,14 @@ class TestWebApp(unittest.TestCase):
         # This structure matches what our process_agent_task returns
         mock_task.result = { 
             'status': 'SUCCESS', 
-            'result': {'id': 1, 'prompt': 'done', 'status': 'completed_successfully'},
+            'result': {
+                'id': 1, 
+                'prompt': 'done', 
+                'status': 'completed_successfully',
+                'generation_history': [{'attempt': 1, 'status': 'success_on_attempt_1', 'error_type': None}],
+                'correction_attempts': 1,
+                'max_correction_attempts': 3 
+            },
             'current_status_message': 'All done!'
         }
 
@@ -122,22 +129,58 @@ class TestWebApp(unittest.TestCase):
         mock_task = MockAsyncResult.return_value
         mock_task.id = "test_task_fail_custom"
         mock_task.state = "FAILURE"
-        # This structure matches what our process_agent_task returns on handled failure
+        # This structure matches what our process_agent_task returns on handled failure (e.g. max attempts)
         mock_task.result = {
             'status': 'FAILURE', 
-            'error': 'Task failed badly due to X.',
-            'current_status_message': 'Processing failed at step X.'
+            'error': 'Agent processing failed, see generation history.',
+            'result': { # This nested 'result' now contains agent_data
+                'id': 1, 
+                'prompt': 'failed prompt', 
+                'status': 'failed_syntax_after_3_attempts',
+                'generation_history': [{'attempt': 1, 'status': 'syntax_error', 'error_type': 'Syntax'}],
+                'correction_attempts': 3,
+                'max_correction_attempts': 3 
+            },
+            'current_status_message': 'Processing failed after multiple attempts.'
         }
-        mock_task.info = mock_task.result # Celery might put the return value in .info for FAILURE states too
+        # Celery might put the task's return value (the dict above) in .info for FAILURE states too,
+        # or sometimes directly in .result. Our app.py code checks task_result.result first.
+        mock_task.info = mock_task.result 
 
         response = self.app.get('/task_status/test_task_fail_custom')
         self.assertEqual(response.status_code, 200)
         json_response = response.get_json()
         self.assertEqual(json_response['state'], "FAILURE")
         self.assertEqual(json_response['status_message'], "Task failed.")
-        self.assertEqual(json_response['error'], 'Task failed badly due to X.')
-        self.assertEqual(json_response['current_status_message'], 'Processing failed at step X.')
+        self.assertEqual(json_response['error'], 'Agent processing failed, see generation history.')
+        self.assertIsNotNone(json_response['result']) # Check that the nested agent_data is present
+        self.assertEqual(json_response['result']['status'], 'failed_syntax_after_3_attempts')
+        self.assertEqual(json_response['result']['correction_attempts'], 3)
+        self.assertTrue(len(json_response['result']['generation_history']) > 0)
+        self.assertEqual(json_response['current_status_message'], 'Processing failed after multiple attempts.')
         MockAsyncResult.assert_called_once_with("test_task_fail_custom", app=celery_app)
+
+    @patch('app.AsyncResult')
+    def test_task_status_route_failure_config_error(self, MockAsyncResult): # For ValueError case
+        mock_task = MockAsyncResult.return_value
+        mock_task.id = "test_task_fail_config"
+        mock_task.state = "FAILURE"
+        mock_task.result = { # Matches the return for ValueError in process_agent_task
+            'status': 'FAILURE',
+            'error': 'Groq API key not provided...',
+            'result': None, # Explicitly None for this error type
+            'current_status_message': 'Failed due to configuration error.'
+        }
+        mock_task.info = mock_task.result
+
+        response = self.app.get('/task_status/test_task_fail_config')
+        self.assertEqual(response.status_code, 200)
+        json_response = response.get_json()
+        self.assertEqual(json_response['state'], "FAILURE")
+        self.assertEqual(json_response['error'], 'Groq API key not provided...')
+        self.assertNotIn('result', json_response) # or self.assertIsNone(json_response.get('result'))
+        MockAsyncResult.assert_called_once_with("test_task_fail_config", app=celery_app)
+
 
     @patch('app.AsyncResult')
     def test_task_status_route_failure_unhandled_exception(self, MockAsyncResult):
