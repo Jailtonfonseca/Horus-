@@ -54,39 +54,64 @@ def process_agent_task(self, prompt: str, llm_type: str, model_name: str = None)
             prompt=prompt,
             llm_type=llm_type,
             model_name=model_name
+            # If max_correction_attempts needs to be configurable, pass it here
         )
 
-        self.update_state(state='PROGRESS', meta={'status': 'Generating code...'})
-        sub_agent.generate_code() # This includes syntax check & dependency identification
-
-        if getattr(sub_agent, 'is_syntax_valid', False):
-            self.update_state(state='PROGRESS', meta={'status': 'Executing code...'})
-            sub_agent.execute_code()
-            if sub_agent.dependencies: # Check if dependencies exist
-                self.update_state(state='PROGRESS', meta={'status': 'Installing dependencies (simulated)...'})
-                sub_agent.install_dependencies()
+        self.update_state(state='PROGRESS', meta={'status': 'Agent processing started (iterative debugging active)...'})
         
-        # Prepare the data to be returned by the task
+        # The generate_code method now encapsulates the iterative debugging loop.
+        # The SubordinateAgent's status will be updated internally during this call.
+        sub_agent.generate_code() 
+        
+        # After the loop, sub_agent.status and other attributes reflect the final state.
+        # No need for separate calls to execute_code or install_dependencies here,
+        # as they are handled within the SubordinateAgent's iterative loop if successful.
+
         agent_data = {
             'id': getattr(sub_agent, 'id', 'N/A'),
             'prompt': getattr(sub_agent, 'prompt', ''),
-            'generated_code': getattr(sub_agent, 'generated_code', ''),
-            'status': getattr(sub_agent, 'status', 'N/A'),
+            'generated_code': getattr(sub_agent, 'generated_code', ''), # Final generated code
+            'status': getattr(sub_agent, 'status', 'N/A'), # Final status from SubordinateAgent
             'is_syntax_valid': getattr(sub_agent, 'is_syntax_valid', None),
             'syntax_error_message': getattr(sub_agent, 'syntax_error_message', None),
             'execution_successful': getattr(sub_agent, 'execution_successful', None),
             'execution_output': getattr(sub_agent, 'execution_output', None),
             'execution_error': getattr(sub_agent, 'execution_error', None),
             'dependencies': list(getattr(sub_agent, 'dependencies', [])),
-            'installation_logs': getattr(sub_agent, 'installation_logs', []) # Changed to [] default
+            'installation_logs': getattr(sub_agent, 'installation_logs', []),
+            'generation_history': getattr(sub_agent, 'generation_history', []), 
+            'correction_attempts': getattr(sub_agent, 'correction_attempts', 0),
+            'max_correction_attempts': getattr(sub_agent, 'max_correction_attempts', 3) # Added
         }
-        return {'status': 'SUCCESS', 'result': agent_data, 'current_status_message': 'Processing complete.'}
+        
+        # Determine overall task success based on SubordinateAgent's final status
+        # This is a simplified check; more robust status parsing from sub_agent.status might be needed
+        # if specific failure types from the loop need to be distinguished here.
+        final_message = f"Processing finished. Agent status: {agent_data['status']}"
+        if "success" in agent_data['status'].lower():
+             return {'status': 'SUCCESS', 'result': agent_data, 'current_status_message': final_message}
+        else:
+            # The 'error' field here should ideally be a summary or the last critical error.
+            # The detailed errors are in generation_history.
+            last_error_entry = next((item for item in reversed(agent_data['generation_history']) if item.get('error_message')), None)
+            error_summary = last_error_entry['error_message'] if last_error_entry else 'Agent processing failed, see generation history.'
+            return {'status': 'FAILURE', 'error': error_summary, 'result': agent_data, 'current_status_message': final_message}
+
     except ValueError as e: # From MainAgent if API key missing etc.
-        # Log e here if possible
-        return {'status': 'FAILURE', 'error': str(e), 'current_status_message': 'Failed due to configuration error.'}
+        return {'status': 'FAILURE', 'error': str(e), 'current_status_message': 'Failed due to configuration error.', 'result': None}
     except Exception as e:
-        # Log the exception e (e.g., import logging; logging.exception("Task error"))
-        return {'status': 'FAILURE', 'error': 'An unexpected error occurred during agent processing.', 'current_status_message': 'Failed due to unexpected error.'}
+        # Attempt to gather some data even if an unexpected error occurs, if sub_agent was initialized
+        agent_data_on_failure = {}
+        if 'sub_agent' in locals() and sub_agent:
+            agent_data_on_failure = {
+                'id': getattr(sub_agent, 'id', 'N/A'),
+                'prompt': getattr(sub_agent, 'prompt', ''),
+                'status': getattr(sub_agent, 'status', f'unexpected_error_in_task: {str(e)}'),
+                'generation_history': getattr(sub_agent, 'generation_history', []),
+                'correction_attempts': getattr(sub_agent, 'correction_attempts', 0)
+            }
+        # import logging; logging.exception("Celery task unexpected error") # Good practice
+        return {'status': 'FAILURE', 'error': f'An unexpected error occurred: {str(e)}', 'result': agent_data_on_failure, 'current_status_message': 'Failed due to an unexpected task error.'}
 
 
 @app.route('/create_agent', methods=['POST'])
