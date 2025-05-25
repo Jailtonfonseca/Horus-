@@ -2,3 +2,4 @@ Flask
 openai
 celery
 redis
+docker

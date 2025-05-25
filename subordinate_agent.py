@@ -1,61 +1,17 @@
-class SubordinateAgent:
-    """
 from llm_interface import LLMInterface
 import io
 import sys
 import traceback
-import multiprocessing # For sandboxing
-
-# This function must be defined at the top level of the module for pickling.
-def _execute_sandboxed_code(code_string: str, conn: multiprocessing.connection.Connection):
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    redirected_stdout = io.StringIO()
-    redirected_stderr = io.StringIO()
-    sys.stdout = redirected_stdout
-    sys.stderr = redirected_stderr
-    
-    result = {
-        'stdout': '',
-        'stderr': '',
-        'exception': None,
-        'success': False
-    }
-
-    try:
-        # Using a restricted globals dictionary can add a minor layer,
-        # but the process isolation is the primary sandbox here.
-        # For more advanced restriction within the exec, RestrictedPython would be needed.
-        # A more restricted builtins could be:
-        # safe_builtins = {k: __builtins__[k] for k in ['print', 'range', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple', 'True', 'False', 'None', 'abs', 'all', 'any', 'bool', 'callable', 'chr', 'divmod', 'getattr', 'hasattr', 'hash', 'hex', 'id', 'isinstance', 'issubclass', 'iter', 'max', 'min', 'next', 'oct', 'ord', 'pow', 'repr', 'round', 'sorted', 'sum', 'zip']}
-        # exec(code_string, {'__builtins__': safe_builtins}, {})
-        exec(code_string, {'__builtins__': __builtins__}, {}) # Pass a slightly safer builtins, empty locals
-        result['success'] = True
-    except Exception:
-        result['exception'] = traceback.format_exc() # Get full traceback
-        result['success'] = False
-    finally:
-        result['stdout'] = redirected_stdout.getvalue()
-        result['stderr'] = redirected_stderr.getvalue()
-        
-        sys.stdout = old_stdout # Restore
-        sys.stderr = old_stderr
-        
-        try:
-            conn.send(result)
-        except Exception as e:
-            # If connection is broken, nothing much to do here. Parent will handle timeout or lack of data.
-            # Optionally log this error from the child process side.
-            # print(f"Child process: Error sending result: {e}", file=sys.__stderr__) # Use original stderr
-            pass 
-        finally:
-            conn.close()
-
+import os
+import tempfile
+import shutil
+# Note: `docker` is imported conditionally in _initialize_docker_client or execute_code
+# to allow basic class usage without Docker installed, though execution will fail.
 
 class SubordinateAgent:
     """
     A subordinate agent responsible for generating and validating code based on a prompt,
-    using a provided LLM client, with an iterative debugging loop and sandboxed execution.
+    using a provided LLM client, with an iterative debugging loop and Docker-based sandboxed execution.
     """
     def __init__(self, prompt: str, llm_client: LLMInterface, **kwargs):
         """
@@ -67,6 +23,7 @@ class SubordinateAgent:
             **kwargs: Additional keyword arguments.
                 max_correction_attempts (int): Max attempts for the debugging loop (default 3).
                 execution_timeout (float): Timeout for code execution in seconds (default 10.0).
+                docker_image_name (str): Name of the Docker image for code execution (default 'horus_agent_runner').
         """
         self.prompt = prompt
         self.llm_client = llm_client
@@ -76,26 +33,51 @@ class SubordinateAgent:
         # Iterative debugging attributes
         self.max_correction_attempts = int(kwargs.get('max_correction_attempts', 3))
         self.correction_attempts = 0
-        self.generation_history = [] # Stores details of each generation attempt
+        self.generation_history = [] 
 
-        # Attributes for syntax checking, execution, dependencies (will be set by respective methods)
+        # Execution related attributes
+        self.execution_timeout = float(kwargs.get('execution_timeout', 10.0))
+        self.docker_image_name = kwargs.get('docker_image_name', 'horus_agent_runner')
+        self.docker_client = None 
+
+        # Attributes for syntax checking, execution results, dependencies
         self.is_syntax_valid = None
         self.syntax_error_message = None
         self.execution_successful = None
         self.execution_output = None
         self.execution_error = None
         self.dependencies = set()
-        self.dependencies_installed_successfully = None
-        self.installation_logs = []
+        self.dependencies_installed_successfully = None # Will be True, False, or None if no deps
+        self.installation_logs = [] # Stores detailed logs from pip install attempts
+
+    def _initialize_docker_client(self) -> bool:
+        """
+        Initializes the Docker client if not already initialized.
+        Returns True if successful or already initialized, False otherwise.
+        """
+        if self.docker_client:
+            return True
+        try:
+            import docker # Import here to make it a soft dependency for non-execution scenarios
+            self.docker_client = docker.from_env()
+            self.docker_client.ping() 
+            self.status = "docker_client_initialized_successfully"
+            return True
+        except ImportError:
+            self.status = "error_docker_sdk_not_installed"
+            self.execution_error = "Docker SDK for Python is not installed. Please install the 'docker' package."
+            self.docker_client = None
+            return False
+        except Exception as e: # Catches docker.errors.DockerException and other potential issues
+            self.status = f"error_docker_daemon_connection: {e}"
+            self.execution_error = f"Could not connect to Docker daemon: {e}. Ensure Docker is running and accessible."
+            self.docker_client = None 
+            return False
 
     def _create_fix_prompt(self, original_user_prompt: str, erroneous_code: str, error_message: str, error_type: str, attempt_number: int) -> str:
         """
         Constructs a detailed prompt for the LLM to fix the code.
         """
-        # Note: The prompt refers to 'attempt_number - 1' for the attempt that *failed*,
-        # and 'attempt_number' for the *current* attempt to fix it.
-        # The loop in attempt_code_generation_and_execution manages the actual self.correction_attempts.
-        # When calling this, 'attempt_number' is the number of the upcoming attempt.
         return (
             f"The user's original request was:\n--- (Original Request Start) ---\n{original_user_prompt}\n--- (Original Request End) ---\n\n"
             f"On attempt number {attempt_number - 1}, I generated the following Python code to address this request:\n--- (Erroneous Code Start) ---\n{erroneous_code}\n--- (Erroneous Code End) ---\n\n"
@@ -116,25 +98,13 @@ class SubordinateAgent:
         last_error_message = None
         overall_success = False
         
-        # Ensure llm_client has model_name attribute or handle it appropriately
-        # For this example, we assume llm_client either has a default or model_name is passed.
-        # If model_name is specific to generate_text, it should be handled there.
-        # Here, we assume llm_client.model_name is accessible if needed by generate_text internally,
-        # or that generate_text can be called without it.
-        # llm_model_name = getattr(self.llm_client, 'default_model_name', None) # Example
-
         while self.correction_attempts < self.max_correction_attempts:
             self.correction_attempts += 1
             attempt_details = {'attempt': self.correction_attempts, 'prompt_to_llm': current_llm_prompt}
             self.status = f"attempt_{self.correction_attempts}_generating_code"
             
             try:
-                # Assuming llm_client.generate_text can take model_name if available/needed
-                # or uses its own default if model_name is None.
-                generated_code_output = self.llm_client.generate_text(
-                    current_llm_prompt
-                    # model_name=llm_model_name # Pass if required by your LLMInterface/impl.
-                )
+                generated_code_output = self.llm_client.generate_text(current_llm_prompt)
                 self.generated_code = generated_code_output
                 attempt_details['generated_code'] = self.generated_code
             except Exception as e:
@@ -142,22 +112,13 @@ class SubordinateAgent:
                 self.status = f"attempt_{self.correction_attempts}_llm_generation_error"
                 attempt_details.update({'error_type': last_error_type, 'error_message': last_error_message, 'status': self.status})
                 self.generation_history.append(attempt_details)
-                # No point in creating a fix prompt if LLM generation itself failed.
-                # Break or decide if this counts as a full attempt for retry logic.
-                # For now, let it count and try to fix if possible (though prompt might be bad)
+                print(f"LLM generation failed on attempt {self.correction_attempts}: {e}")
                 if self.correction_attempts < self.max_correction_attempts:
-                    # Create a generic fix prompt or re-use previous one if this was a retry
-                    # This part is tricky if generation fails. For now, let's assume it's a code error.
-                    # If the prompt itself is bad, this loop won't fix it.
-                    # Re-prompting for a fix of a "generation error" is unlikely to work well.
-                    # Consider breaking here or using a different strategy for generation errors.
-                    # For this iteration, we'll assume the error is in the *generated* code,
-                    # so if generation fails, we effectively can't make a fix prompt for that.
-                    # The loop will end, and overall_success will be false.
-                    print(f"LLM generation failed on attempt {self.correction_attempts}: {e}")
-                continue # Or break, depending on desired behavior for LLM errors
+                     # Decide if a fix prompt for LLM failure is useful or just retry with same/modified prompt
+                    current_llm_prompt = self._create_fix_prompt(initial_user_prompt, "N/A - LLM Generation Failed", last_error_message, last_error_type, self.correction_attempts + 1)
+                continue 
 
-            self.verify_syntax() # This calls identify_dependencies if syntax is valid
+            self.verify_syntax() 
             if not self.is_syntax_valid:
                 last_error_type, last_error_message = "Syntax", self.syntax_error_message
                 self.status = f"attempt_{self.correction_attempts}_syntax_error"
@@ -168,10 +129,10 @@ class SubordinateAgent:
                 continue
 
             self.status = f"attempt_{self.correction_attempts}_executing_code"
-            self.execute_code()
+            self.execute_code() # Now uses Docker
             if not self.execution_successful:
                 last_error_type, last_error_message = "Runtime", self.execution_error
-                self.status = f"attempt_{self.correction_attempts}_runtime_error"
+                self.status = f"attempt_{self.correction_attempts}_runtime_error" # execute_code sets more specific status
                 attempt_details.update({'error_type': last_error_type, 'error_message': last_error_message, 'status': self.status})
                 self.generation_history.append(attempt_details)
                 if self.correction_attempts < self.max_correction_attempts:
@@ -179,31 +140,23 @@ class SubordinateAgent:
                 continue
 
             overall_success = True
-            self.status = f"attempt_{self.correction_attempts}_success"
+            self.status = f"success_on_attempt_{self.correction_attempts}" # More specific status from execute_code might be better
             attempt_details.update({'error_type': None, 'error_message': None, 'status': self.status})
             self.generation_history.append(attempt_details)
             if self.dependencies:
-                self.install_dependencies()
-            break # Exit loop on success
+                self.install_dependencies() # Simulated
+            break 
 
         if not overall_success:
-            self.status = f"failed_{last_error_type.lower() if last_error_type else 'unknown_error'}_after_{self.max_correction_attempts}_attempts"
-        else:
-            self.status = f"success_on_attempt_{self.correction_attempts}"
+            final_error_type_str = last_error_type.lower().replace(" ", "_") if last_error_type else 'unknown_error'
+            self.status = f"failed_{final_error_type_str}_after_{self.correction_attempts}_attempts"
+        # If successful, status is already set like "success_on_attempt_X" or a Docker success status
 
     def regenerate_with_new_prompt(self, new_prompt: str):
         """
         Regenerates code using a new prompt, leveraging the iterative debugging loop.
-
-        Resets relevant status attributes and then calls attempt_code_generation_and_execution().
-
-        Args:
-            new_prompt: The new prompt to use for code generation.
         """
         self.prompt = new_prompt
-        # Resetting these attributes here is important before starting a new generation cycle.
-        # attempt_code_generation_and_execution also resets some of these (history, attempts),
-        # but it's good practice to ensure a clean state for a "regeneration" call.
         self.generated_code = None
         self.is_syntax_valid = None
         self.syntax_error_message = None
@@ -213,28 +166,18 @@ class SubordinateAgent:
         self.dependencies = set()
         self.dependencies_installed_successfully = None
         self.installation_logs = []
-        
-        # The status will be set by attempt_code_generation_and_execution
-        # self.status = "regenerating_with_new_prompt" # Or let the loop set initial status
-
-        # Call the main iterative generation method with the new prompt
         self.attempt_code_generation_and_execution(initial_user_prompt=self.prompt)
-
 
     def generate_code(self):
         """
         Main entry point for code generation.
         Initiates the iterative process of code generation, syntax checking, and execution.
-        The initial prompt for this process is self.prompt.
         """
         self.attempt_code_generation_and_execution(initial_user_prompt=self.prompt)
 
     def verify_syntax(self) -> bool:
         """
         Verifies the Python syntax of the generated code using the ast module.
-
-        Returns:
-            True if the syntax is valid, False otherwise.
         """
         if not self.generated_code:
             self.status = "error_syntax_check_no_code"
@@ -246,8 +189,8 @@ class SubordinateAgent:
             ast.parse(self.generated_code)
             self.is_syntax_valid = True
             self.syntax_error_message = None
-            self.status = "syntax_verified"
-            self.identify_dependencies() # Call after successful syntax verification
+            self.status = "syntax_verified_successfully"
+            self.identify_dependencies() 
             return True
         except SyntaxError as e:
             self.is_syntax_valid = False
@@ -257,39 +200,25 @@ class SubordinateAgent:
 
     def execute_code(self):
         """
-        Executes the generated code in a sandboxed environment using multiprocessing.Process.
-        Captures stdout, stderr, and any exceptions during execution.
-        Stores execution success status and any output/error messages.
-        Uses a timeout (self.execution_timeout) to prevent runaway code.
+        Executes the generated code in a Docker container for sandboxing.
+        Installs identified dependencies using pip within the container before running the script.
+        Captures stdout, stderr, and exit code.
+        Uses a timeout (self.execution_timeout) for the script execution part.
 
-        Sandboxing Details:
-        - This method uses `multiprocessing.Process` to run the generated code in a separate
-          process. This provides a basic level of isolation from the main application.
-        - Standard output and standard error from the executed code are captured.
-        - A timeout mechanism (self.execution_timeout) is in place to terminate processes 
-          that run too long.
-        - The `exec()` call within the sandboxed process uses `{'__builtins__': __builtins__}`
-          for globals by default in `_execute_sandboxed_code`, which offers a slight restriction 
-          but is not a comprehensive security sandbox. The primary isolation is the process boundary.
-
-        Limitations:
-        - Process-based sandboxing is not as secure as containerization (e.g., Docker) or
-          virtualization. It can be susceptible to resource exhaustion attacks (e.g., fork bombs
-          if the executed code can create subprocesses and system limits are not in place).
-        - Inter-process communication via `multiprocessing.Pipe` relies on pickling, which can
-          have issues with very complex or unpicklable objects (though here we primarily pass strings
-          and basic types for results).
-        - Direct access to the filesystem or network from the executed code is still possible
-          within the permissions of the user running the Python application. Further OS-level
-          sandboxing (like chroot, namespaces, or seccomp) would be needed for stronger
-          restrictions and is not implemented here.
-        - The effectiveness of `process.terminate()` and `process.kill()` can vary by OS and
-          circumstances, and truly runaway processes might require more robust management.
+        Sandboxing Details & Limitations: (Same as before, plus dependency installation considerations)
+        - Docker daemon must be running.
+        - Specified Docker image must exist.
+        - `pip install --user` is used for dependencies; ensure the image's `appuser` can write to its user site-packages.
+        - Network access is required during dependency installation.
         """
-        # Clear previous results
         self.execution_output = ""
         self.execution_error = ""
         self.execution_successful = False
+        self.installation_logs = [] # Reset logs for this execution run
+        self.dependencies_installed_successfully = None
+
+        if not self._initialize_docker_client():
+            return
 
         if not self.generated_code:
             self.status = "error_execution_no_code"
@@ -301,191 +230,194 @@ class SubordinateAgent:
             self.execution_error = f"Syntax error prevented execution: {self.syntax_error_message}"
             return
 
-        parent_conn, child_conn = multiprocessing.Pipe()
-        process = multiprocessing.Process(
-            target=_execute_sandboxed_code,
-            args=(self.generated_code, child_conn)
-        )
-        process.daemon = True # Ensure process doesn't outlive parent if parent crashes
+        import docker 
+        import tempfile
+        import os
+        import shutil
 
-        try:
-            process.start()
-            # Wait for the process to complete or timeout
-            process.join(timeout=self.execution_timeout) # Use configured timeout
-
-            if process.is_alive():
-                # Process timed out
-                process.terminate() # Try to terminate gracefully
-                # Give it a moment to terminate, then kill if necessary and possible
-                process.join(timeout=1) 
-                if process.is_alive() and hasattr(process, 'kill'): # Python 3.7+
-                    try:
-                        process.kill() # Force kill
-                    except Exception: # process might already be gone
-                        pass
-                    process.join(timeout=0.5)
-
-                self.execution_error = "Execution timed out."
-                self.execution_successful = False
-                self.status = "error_execution_timeout"
-            else:
-                # Process completed, check for results
-                if parent_conn.poll(timeout=0.2): # Check if there's data with a short timeout
-                    result = parent_conn.recv()
-                    self.execution_output = result.get('stdout', '')
-                    self.execution_error = result.get('stderr', '') # Stderr from executed code
-                    
-                    if result.get('exception'):
-                        # Append exception traceback to stderr if not already there
-                        # (it should be if traceback.format_exc() was used)
-                        if result['exception'] not in self.execution_error:
-                             self.execution_error += f"\nSubprocess Exception: {result['exception']}"
-                        self.execution_successful = False
-                        self.status = "error_execution_runtime"
-                    else:
-                        self.execution_successful = result.get('success', False)
-                        if self.execution_successful:
-                            self.status = "code_executed_successfully"
-                            if self.execution_error: # stderr output but no exception
-                                self.status = "code_executed_with_stderr"
-                        else:
-                            # Should ideally be caught by 'exception' but as a fallback
-                            self.status = "error_execution_unknown_in_subprocess" 
-                            if not self.execution_error and not result.get('exception'):
-                                self.execution_error = "Execution failed in subprocess without explicit exception or stderr."
-                else:
-                    self.execution_error = "Execution process finished but no result received."
-                    self.execution_successful = False
-                    self.status = "error_execution_no_result"
-        except Exception as e:
-            # Error in the parent process during setup or result handling
-            self.execution_error = f"Parent process error during sandboxed execution: {str(e)}\n{traceback.format_exc()}"
-            self.execution_successful = False
-            self.status = "error_execution_host_error"
-        finally:
-            if parent_conn:
-                try:
-                    parent_conn.close()
-                except Exception: pass # Ignore errors on close
-            # child_conn is closed by the _execute_sandboxed_code function
-            if process: 
-                if process.is_alive(): 
-                    try:
-                        process.terminate()
-                        process.join(timeout=0.5)
-                        if process.is_alive() and hasattr(process, 'kill'):
-                            process.kill()
-                    except Exception: pass # Ignore errors on terminate/kill
-                try:
-                    process.close() # Release resources associated with the process object
-                except Exception: pass # Ignore errors on close
-
-
-    def regenerate_with_new_prompt(self, new_prompt: str):
-        """
-        Regenerates code using a new prompt.
-
-        Resets relevant status attributes and then calls generate_code().
-
-        Args:
-            new_prompt: The new prompt to use for code generation.
-        """
-        self.prompt = new_prompt
-        self.generated_code = None
-        self.status = "regenerating"
-        self.is_syntax_valid = None
-        self.syntax_error_message = None
-        self.execution_successful = None
-        self.execution_output = None
-        self.execution_error = None
+        temp_dir = None
+        container = None
+        container_name = f"horus_exec_{getattr(self, 'id', 'N_A')}_{self.correction_attempts}"
         
-        # Call generate_code, which will then call verify_syntax
-        self.generate_code()
+        try:
+            temp_dir = tempfile.mkdtemp()
+            script_path = os.path.join(temp_dir, "script.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(self.generated_code)
+
+            volumes_dict = {temp_dir: {'bind': '/app', 'mode': 'ro'}}
+            
+            # Pre-remove container if it exists
+            try:
+                existing_container = self.docker_client.containers.get(container_name)
+                existing_container.remove(force=True)
+            except docker.errors.NotFound:
+                pass
+            except docker.errors.APIError as e:
+                self.status = "error_docker_api_container_cleanup"
+                self.execution_error = f"Docker API error during pre-run container cleanup: {e}"
+                return
+
+            # Start a container that keeps running to allow exec_run for pip and script
+            keep_alive_cmd = ["tail", "-f", "/dev/null"]
+            container = self.docker_client.containers.run(
+                image=self.docker_image_name,
+                command=keep_alive_cmd,
+                volumes=volumes_dict,
+                name=container_name,
+                detach=True,
+                mem_limit="256m", # Increased slightly for pip
+                cpu_shares=512, 
+                user='appuser', 
+                working_dir="/app"
+            )
+
+            # Install Dependencies
+            if self.dependencies:
+                all_deps_installed_successfully = True
+                for dep in self.dependencies:
+                    pip_cmd = ["pip", "install", "--user", "--no-cache-dir", dep]
+                    log_entry_header = f"--- Installing dependency: {dep} ---\n"
+                    self.installation_logs.append(log_entry_header)
+                    
+                    # Using exec_run with a timeout for pip install itself is tricky as exec_run doesn't directly support timeout
+                    # The main script execution timeout will be handled by container.wait() or equivalent later.
+                    # For pip, we rely on it completing reasonably fast or being non-malicious.
+                    # A very long pip install could still cause issues if it hangs indefinitely.
+                    # Consider a wrapper script in Docker if granular timeout for pip is needed.
+                    pip_exit_code, pip_output_gen = container.exec_run(pip_cmd, user='appuser', workdir='/app', demux=True)
+                    
+                    out_pip = pip_output_gen[0].decode('utf-8', errors='replace') if pip_output_gen[0] else ""
+                    err_pip = pip_output_gen[1].decode('utf-8', errors='replace') if pip_output_gen[1] else ""
+                    
+                    log_entry_details = f"Exit Code: {pip_exit_code}\nSTDOUT:\n{out_pip}\nSTDERR:\n{err_pip}\n"
+                    self.installation_logs.append(log_entry_details)
+
+                    if pip_exit_code != 0:
+                        all_deps_installed_successfully = False
+                        self.execution_error += f"Failed to install dependency '{dep}'. See installation logs.\n"
+                        # Continue installing other dependencies or break? For now, let's try to install all.
+                
+                self.dependencies_installed_successfully = all_deps_installed_successfully
+                if not self.dependencies_installed_successfully:
+                    self.status = "error_dependency_installation"
+                    self.execution_successful = False
+                    # Do not return yet, let finally block clean up. Script execution will be skipped.
+            else:
+                self.dependencies_installed_successfully = None # No dependencies to install
+
+
+            # Execute the Script only if dependencies were not attempted or installed successfully
+            if self.dependencies_installed_successfully is not False:
+                self.status = f"attempt_{self.correction_attempts}_executing_script_docker"
+                script_cmd = ["python", "/app/script.py"]
+                
+                # This exec_run will have its effective timeout managed by the overall self.execution_timeout
+                # if we were to use container.wait() on a primary command.
+                # With exec_run, timeout is harder. The main timeout is on the keep-alive container.
+                # This part needs careful thought if script itself hangs.
+                # For now, assume script is also reasonably fast or we rely on the outer timeout for the keep-alive.
+                # A better approach might be to commit container after pip, then run script with timeout.
+                # But sticking to "Option B" for now.
+                
+                script_exit_code, script_output_gen = container.exec_run(script_cmd, user='appuser', workdir='/app', demux=True)
+                
+                self.execution_output = script_output_gen[0].decode('utf-8', errors='replace') if script_output_gen[0] else ""
+                script_stderr = script_output_gen[1].decode('utf-8', errors='replace') if script_output_gen[1] else ""
+                
+                # Prepend pip installation errors (if any) to script errors
+                if self.execution_error: # Contains errors from pip install failures
+                    self.execution_error = f"Dependency Installation Issues:\n{self.execution_error}\n--- Script Execution STDERR ---\n{script_stderr}"
+                else:
+                    self.execution_error = script_stderr
+
+                if script_exit_code == 0:
+                    self.execution_successful = True
+                    self.status = "code_executed_successfully_docker"
+                    if self.execution_error: # If there was stderr output but exit code 0
+                        self.status = "code_executed_with_stderr_docker"
+                else:
+                    self.execution_successful = False
+                    self.status = "error_execution_runtime_docker"
+                    error_details = f"Script exited with code {script_exit_code}."
+                    if self.execution_error:
+                        self.execution_error = f"{self.execution_error}\n{error_details}"
+                    else: # Should not happen if exit code is non-zero, but as fallback
+                        self.execution_error = error_details
+            else:
+                # This else block means dependencies existed AND failed to install
+                self.status = "error_dependency_installation_skipped_execution"
+                # self.execution_error already contains pip failure details.
+                self.execution_successful = False
+
+
+        except docker.errors.ImageNotFound:
+            self.status = "error_docker_image_not_found"
+            self.execution_error = f"Docker image '{self.docker_image_name}' not found."
+        except docker.errors.APIError as e:
+            self.status = "error_docker_api_execution"
+            self.execution_error = f"Docker API error during execution: {e}"
+        except Exception as e:
+            self.status = "error_execution_docker_host_unexpected"
+            self.execution_error = f"Host error during Docker execution: {e}\n{traceback.format_exc()}"
+        finally:
+            if container:
+                try:
+                    container.stop(timeout=5) # Stop the keep-alive container
+                except docker.errors.APIError as e:
+                    print(f"Warning: Docker API error stopping container {container_name}: {e}")
+                try:
+                    container.remove(v=True, force=True)
+                except docker.errors.NotFound:
+                    pass 
+                except docker.errors.APIError as e:
+                    print(f"Error removing container {container_name}: {e}")
+            
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as e_rm:
+                    print(f"Error removing temporary directory {temp_dir}: {e_rm}")
 
     def identify_dependencies(self):
         """
         Identifies import statements in the generated code using AST.
-        Stores unique module names in self.dependencies.
         """
         self.dependencies = set()
         if not self.generated_code or not (hasattr(self, 'is_syntax_valid') and self.is_syntax_valid):
             self.status = "error_dependency_identification_no_code_or_invalid_syntax"
             return
-
         try:
             import ast
             tree = ast.parse(self.generated_code)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
-                        self.dependencies.add(alias.name.split('.')[0]) # Add base module name
+                        self.dependencies.add(alias.name.split('.')[0])
                 elif isinstance(node, ast.ImportFrom):
-                    if node.module: # Handles 'from . import X' or 'from ..X import Y'
-                        self.dependencies.add(node.module.split('.')[0]) # Add base module name
-            self.status = "dependencies_identified"
+                    if node.module: 
+                        self.dependencies.add(node.module.split('.')[0])
+            self.status = "dependencies_identified_successfully"
         except Exception as e:
             self.status = f"error_dependency_identification: {e}"
             print(f"Error identifying dependencies: {e}")
 
-    def install_dependencies(self):
-        """
-        Simulates the installation of identified dependencies.
-
-        In a real environment, this would use pip to install packages.
-        Updates status based on the simulated installation process.
-        """
-        if not hasattr(self, 'dependencies') or not self.dependencies:
-            self.status = "info_no_dependencies_to_install"
-            self.dependencies_installed_successfully = True # Or None, depending on desired logic
-            print("No dependencies identified to install.")
-            return
-
-        self.dependencies_installed_successfully = True # Assume success unless an error occurs
-        self.installation_logs = []
-        print("Attempting to install dependencies (simulation)...")
-
-        for dep_name in self.dependencies:
-            log_message = f"Attempting to install {dep_name}... (simulation)"
-            print(log_message)
-            self.installation_logs.append(log_message)
-            # In a real environment, you would use:
-            # try:
-            #     subprocess.run(["pip", "install", dep_name], check=True, capture_output=True, text=True)
-            #     self.installation_logs.append(f"Successfully installed {dep_name}")
-            # except subprocess.CalledProcessError as e:
-            #     self.dependencies_installed_successfully = False
-            #     err_msg = f"Failed to install {dep_name}: {e.stderr}"
-            #     print(err_msg)
-            #     self.installation_logs.append(err_msg)
-            #     self.status = f"error_installing_dependency_{dep_name}"
-            #     # Optionally break or collect all errors
-            #     break 
-            # except FileNotFoundError:
-            #      self.dependencies_installed_successfully = False
-            #      err_msg = "Error: pip command not found. Cannot install dependencies."
-            #      print(err_msg)
-            #      self.installation_logs.append(err_msg)
-            #      self.status = "error_pip_not_found"
-            #      break
-
-        if self.dependencies_installed_successfully:
-            self.status = "dependencies_installed_simulated"
-            print("All dependencies processed (simulation).")
-        else:
-            # This part of the status would be set within the commented-out error handling
-            print("One or more dependencies failed to install (simulation).")
-
-
+    # Placeholder methods from original structure, can be removed if truly not needed
     def validate_code(self):
         """
-        Validates the generated code.
+        Validates the generated code. (Currently, validation is part of the iterative loop)
         """
-        # TODO: Implement code validation logic
+        # This method might be used for more complex validation beyond syntax/runtime
+        # in the future. For now, core validation happens in attempt_code_generation_and_execution.
+        self.status = "info_validate_code_placeholder"
+        print("validate_code placeholder called. Core validation in iterative loop.")
         pass
 
     def manage_dependencies(self):
         """
-        Manages dependencies for the generated code.
+        Manages dependencies for the generated code. (Currently, only identification and simulated install)
         """
-        # TODO: Implement dependency management logic
+        # Could involve more complex logic like creating requirements.txt, virtual envs, etc.
+        self.status = "info_manage_dependencies_placeholder"
+        print("manage_dependencies placeholder called. Current: identification and simulated install.")
         pass

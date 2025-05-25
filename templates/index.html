@@ -199,8 +199,21 @@
             if (agentData.dependencies && agentData.dependencies.length > 0) {
                 htmlContent += `<p><strong>Identified Dependencies:</strong></p><pre>${escapeHtml(agentData.dependencies.join(', '))}</pre>`;
             }
+            // Display dependencies_installed_successfully status
+            if (typeof agentData.dependencies_installed_successfully === 'boolean') {
+                htmlContent += `<p><strong>Dependencies Installed Successfully:</strong> ${agentData.dependencies_installed_successfully ? '<span style="color: green; font-weight: bold;">Yes</span>' : '<span style="color: red; font-weight: bold;">No</span>'}</p>`;
+            } else if (agentData.dependencies && agentData.dependencies.length > 0 && (agentData.dependencies_installed_successfully === null || typeof agentData.dependencies_installed_successfully === 'undefined')) {
+                // If deps were identified but installation status is null/undefined (e.g., script execution failed before this stage was decisively set)
+                htmlContent += `<p><strong>Dependencies Installed Successfully:</strong> <span style="color: orange;">Unknown / Not Conclusively Determined</span></p>`;
+            }
+            // If no dependencies, this section can be omitted or explicitly state "No dependencies identified".
+            // Current logic: if agentData.dependencies is empty, this section won't show anything specific about success/failure of installation, which is fine.
+
+
+            // Display installation_logs
             if (agentData.installation_logs && agentData.installation_logs.length > 0) {
-                htmlContent += `<p><strong>Installation Logs (Simulated):</strong></p><pre>${escapeHtml(agentData.installation_logs.join('\n'))}</pre>`;
+                htmlContent += `<p><strong>Dependency Installation Logs:</strong></p>
+                                <pre style="background-color: #333; color: #fff; padding: 10px; border-radius: 5px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word;">${escapeHtml(agentData.installation_logs.join('\n\n--------------------\n\n'))}</pre>`;
             }
 
             // Display correction attempts and generation history

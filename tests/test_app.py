@@ -110,7 +110,9 @@ class TestWebApp(unittest.TestCase):
                 'status': 'completed_successfully',
                 'generation_history': [{'attempt': 1, 'status': 'success_on_attempt_1', 'error_type': None}],
                 'correction_attempts': 1,
-                'max_correction_attempts': 3 
+                'max_correction_attempts': 3,
+                'installation_logs': ["Successfully installed requests", "Log from pip..."],
+                'dependencies_installed_successfully': True
             },
             'current_status_message': 'All done!'
         }
@@ -121,6 +123,10 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(json_response['state'], "SUCCESS")
         self.assertEqual(json_response['status_message'], "Task completed successfully.")
         self.assertEqual(json_response['result']['prompt'], 'done')
+        self.assertIsInstance(json_response['result']['installation_logs'], list)
+        self.assertEqual(json_response['result']['installation_logs'][0], "Successfully installed requests")
+        self.assertIsInstance(json_response['result']['dependencies_installed_successfully'], bool)
+        self.assertTrue(json_response['result']['dependencies_installed_successfully'])
         self.assertEqual(json_response['current_status_message'], 'All done!')
         MockAsyncResult.assert_called_once_with("test_task_success", app=celery_app)
     
@@ -139,7 +145,9 @@ class TestWebApp(unittest.TestCase):
                 'status': 'failed_syntax_after_3_attempts',
                 'generation_history': [{'attempt': 1, 'status': 'syntax_error', 'error_type': 'Syntax'}],
                 'correction_attempts': 3,
-                'max_correction_attempts': 3 
+                'max_correction_attempts': 3,
+                'installation_logs': ["Attempting to install failed_package...", "pip error..."],
+                'dependencies_installed_successfully': False
             },
             'current_status_message': 'Processing failed after multiple attempts.'
         }
@@ -157,6 +165,8 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(json_response['result']['status'], 'failed_syntax_after_3_attempts')
         self.assertEqual(json_response['result']['correction_attempts'], 3)
         self.assertTrue(len(json_response['result']['generation_history']) > 0)
+        self.assertIsInstance(json_response['result']['installation_logs'], list)
+        self.assertFalse(json_response['result']['dependencies_installed_successfully'])
         self.assertEqual(json_response['current_status_message'], 'Processing failed after multiple attempts.')
         MockAsyncResult.assert_called_once_with("test_task_fail_custom", app=celery_app)
 

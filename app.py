@@ -1,7 +1,14 @@
 from flask import Flask, render_template, request, jsonify, url_for # Added jsonify, url_for
 from celery import Celery
-from celery.result import AsyncResult # Added AsyncResult
+from celery.result import AsyncResult 
 from main_agent import MainAgent
+
+# Attempt to import Docker-specific errors for more granular exception handling
+try:
+    import docker.errors
+    DOCKER_ERRORS_IMPORTED = True
+except ImportError:
+    DOCKER_ERRORS_IMPORTED = False
 
 app = Flask(__name__)
 
