@@ -1,0 +1,85 @@
+# Sistema de Agente de IA Orquestrador
+
+Este documento fornece instruções sobre como configurar e executar o sistema de agente de IA.
+
+## Visão Geral
+
+O sistema consiste em dois componentes principais:
+1.  `agente_principal.py`: O orquestrador. Este agente é responsável por interagir com a API de IA (Groq), gerenciar o agente subordinado e executar testes para validar o progresso.
+2.  `agente_subordinado.py`: O trabalhador. Este é o arquivo de código que o agente principal modifica iterativamente para cumprir a tarefa especificada pelo usuário.
+
+O objetivo é fornecer uma tarefa ao `agente_principal.py`, que então guiará o desenvolvimento do `agente_subordinado.py` até que a tarefa seja concluída com sucesso.
+
+## Requisitos
+
+- Python 3.10+
+- Uma chave de API da Groq
+
+## Configuração
+
+1.  **Instale as dependências (se houver):**
+    Atualmente, o projeto usa apenas bibliotecas padrão do Python, então nenhuma instalação é necessária.
+
+2.  **Configure a Chave de API da Groq:**
+    O `agente_principal.py` precisa de uma chave de API para se comunicar com o modelo de linguagem da Groq. Você deve definir esta chave como uma variável de ambiente.
+
+    **No Linux ou macOS:**
+    ```bash
+    export GROQ_API_KEY="sua_chave_de_api_aqui"
+    ```
+
+    **No Windows (PowerShell):**
+    ```powershell
+    $env:GROQ_API_KEY="sua_chave_de_api_aqui"
+    ```
+
+    **AVISO:** Nunca escreva sua chave de API diretamente no código-fonte.
+
+## Como Executar
+
+Execute o `agente_principal.py` a partir do seu terminal, fornecendo uma tarefa.
+
+**Sintaxe do Comando:**
+```bash
+python agente_principal.py --tarefa "sua descrição da tarefa aqui" [opções]
+```
+
+### Argumentos da Linha de Comando
+
+-   `--tarefa` (obrigatório): Uma string que descreve o que o `agente_subordinado.py` deve fazer.
+    Exemplo: `"crie uma função que recebe uma lista de números e retorna a soma deles"`
+
+-   `--workspace` (opcional): O caminho para a pasta onde os arquivos de trabalho serão armazenados.
+    -   Padrão: `./workspace`
+    -   O agente criará esta pasta se ela não existir. Dentro dela, você encontrará:
+        -   `agente_subordinado.py`: A versão atual do código em desenvolvimento.
+        -   `instrucoes.txt`: O log de progresso legível por humanos.
+        -   `agente.log`: Um log técnico detalhado de todas as operações.
+        -   `backups/`: Contém backups de `agente_subordinado.py` a cada modificação.
+
+-   `--max_ciclos` (opcional): O número máximo de tentativas (ciclos) que o agente fará para completar a tarefa.
+    -   Padrão: `50`
+
+-   `--intervalo` (opcional): O tempo de espera em segundos entre cada ciclo.
+    -   Padrão: `5.0`
+
+-   `--dry-run` (opcional): Uma flag que executa toda a lógica do agente (chamadas de API, processamento de respostas) sem realmente modificar nenhum arquivo no disco. Útil para testes e depuração.
+
+### Exemplo de Uso
+
+```bash
+python agente_principal.py --tarefa "implemente uma função em agente_subordinado.py que verifique se um número é primo"
+```
+
+## O Processo de Orquestração
+
+1.  O `agente_principal` inicia com a sua tarefa.
+2.  Ele lê o estado atual do `agente_subordinado.py` e o resultado do último teste.
+3.  Ele envia essas informações (o "contexto") para a IA da Groq.
+4.  A IA responde com uma sugestão de alteração no código (`replace_file`, `append`, `replace_block`) em formato JSON.
+5.  O `agente_principal` valida a resposta, faz um backup do arquivo antigo e aplica a alteração.
+6.  Ele executa um comando de teste (fornecido pela IA ou um teste de sintaxe padrão).
+7.  Se o teste passar, ele considera a tarefa mais próxima da conclusão. Se o teste falhar, o erro é usado como contexto para o próximo ciclo.
+8.  O processo se repete até que o teste passe e a tarefa seja considerada concluída, ou até que o número máximo de ciclos seja atingido.
+
+Você pode acompanhar o progresso em tempo real observando o output no terminal e verificando os arquivos `instrucoes.txt` e `agente.log` na pasta `workspace`.
