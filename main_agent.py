@@ -1,14 +1,7 @@
-class MainAgent:
-    """
-    The main agent responsible for orchestrating subordinate agents.
-    """
-    def __init__(self, groq_api_key: str):
-        """
-        Initializes the MainAgent.
-
-import os # Added import
+import os
 from llm_groq import GroqLLM
 from llm_openai import OpenAILLM
+from subordinate_agent import SubordinateAgent
 
 class MainAgent:
     """
@@ -26,7 +19,6 @@ class MainAgent:
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.agents = {}
         self.next_agent_id = 0
-        # TODO: Potentially initialize a default LLM client here or allow selection.
 
     def create_subordinate_agent(self, prompt: str, llm_type: str = "groq", model_name: str = None):
         """
@@ -44,8 +36,6 @@ class MainAgent:
         Raises:
             ValueError: If an unsupported llm_type is provided or if the required API key is missing.
         """
-        from subordinate_agent import SubordinateAgent
-        
         llm_client = None
         if llm_type == "groq":
             if not self.groq_api_key:
@@ -72,7 +62,6 @@ class MainAgent:
         Manages the lifecycle and execution of subordinate agents.
         (Placeholder for now)
         """
-        # TODO: Implement agent management logic
         print(f"Managing {len(self.agents)} agents.")
         pass
 

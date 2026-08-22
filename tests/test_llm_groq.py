@@ -98,7 +98,7 @@ class TestGroqLLM(unittest.TestCase):
     @patch('llm_groq.groq.Groq')
     def test_generate_text_api_status_error(self, MockGroqClient):
         mock_client_instance = MockGroqClient.return_value
-        mock_response = MagicMock(spec=groq_sdk.groq_response.GroqResponse) # Adjusted for Groq if different
+        mock_response = MagicMock()
         mock_response.status_code = 400 
         mock_client_instance.chat.completions.create.side_effect = groq_sdk.APIStatusError(message="Bad request", response=mock_response, body=None)
         llm = GroqLLM(api_key=self.api_key)

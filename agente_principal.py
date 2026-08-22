@@ -332,7 +332,7 @@ def main():
         else:
             extra_instructions = ""
 
-        context = f\"\"\"
+        context = f"""
         Tarefa do Usuário: {args.tarefa}
 
         Arquivo a ser modificado: 'agente_subordinado.py'
@@ -349,7 +349,7 @@ def main():
         Instruções adicionais: {extra_instructions}
 
         Por favor, forneça sua próxima ação no formato JSON especificado.
-        \"\"\"
+        """
 
         # 2. Chamar API
         logging.info("Enviando contexto para a API da Groq...")
