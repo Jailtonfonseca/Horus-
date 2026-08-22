@@ -12,8 +12,8 @@ app.config.from_object('celery_config')
 def make_celery(flask_app):
     celery_instance = Celery(
         flask_app.import_name,
-        broker=flask_app.config['broker_url'], # Use broker_url from config
-        backend=flask_app.config['result_backend'] # Use result_backend from config
+        broker=flask_app.config.get('broker_url', flask_app.config.get('BROKER_URL', 'redis://localhost:6379/0')),
+        backend=flask_app.config.get('result_backend', flask_app.config.get('RESULT_BACKEND', 'redis://localhost:6379/0'))
     )
     celery_instance.conf.update(flask_app.config)
 
@@ -161,6 +161,8 @@ def task_status_route(task_id):
         if task_result.result and isinstance(task_result.result, dict): # Error returned by our task structure
             response_data['error'] = task_result.result.get('error', 'Unknown error')
             response_data['current_status_message'] = task_result.result.get('current_status_message', 'Failed')
+            if 'result' in task_result.result and task_result.result['result'] is not None:
+                response_data['result'] = task_result.result.get('result')
         elif isinstance(task_result.info, Exception): # Unhandled exception in task
             response_data['error'] = str(task_result.info)
             response_data['current_status_message'] = 'Failed with unhandled exception.'

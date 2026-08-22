@@ -105,7 +105,7 @@ class TestOpenAILLM(unittest.TestCase):
     def test_generate_text_api_status_error(self, MockOpenAIClient):
         mock_client_instance = MockOpenAIClient.return_value
         # Proper mocking for APIStatusError requires a response object with a status_code
-        mock_response = MagicMock(spec=openai.openai_response.OpenAIResponse)
+        mock_response = MagicMock()
         mock_response.status_code = 400 # Example status code
         mock_client_instance.chat.completions.create.side_effect = openai.APIStatusError(message="Bad request", response=mock_response, body=None)
         llm = OpenAILLM(api_key=self.api_key)

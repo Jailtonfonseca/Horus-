@@ -196,7 +196,7 @@ class TestWebApp(unittest.TestCase):
         json_response = response.get_json()
         self.assertEqual(json_response['state'], "FAILURE")
         self.assertEqual(json_response['status_message'], "Task failed.")
-        self.assertEqual(json_response['error'], "ValueError('Something went very wrong')") # str(exception)
+        self.assertEqual(json_response['error'], "Something went very wrong") # str(exception)
         self.assertEqual(json_response['current_status_message'], 'Failed with unhandled exception.')
         MockAsyncResult.assert_called_once_with("test_task_fail_unhandled", app=celery_app)
 
